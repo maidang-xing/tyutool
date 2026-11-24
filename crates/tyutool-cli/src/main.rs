@@ -104,12 +104,25 @@ enum Commands {
     },
     /// Dump raw USB/serial metadata for cross-OS survey (JSON).
     UsbPortSurvey,
-    /// Hardware-reset the device via DTR/RTS (UART)
-    Reset {
-        /// Serial port (default: first available)
+    /// Probe target device info (Chip ID, Flash ID, Flash UUID)
+    #[command(visible_alias = "info")]
+    Probe {
+        /// Target port (optional for USB devices like JieLi)
         #[arg(short = 'p', long = "port")]
         port: Option<String>,
-        /// Chip id: Beken uses the same DTR/RTS pulse as flash handshake (bk7231n/t2 vs t5ai/t3/t1/t9); ESP32* uses espflash hard_reset
+        /// Uart baud rate
+        #[arg(short = 'b', long = "baud")]
+        baud: Option<u32>,
+        /// Soc name
+        #[arg(short = 'd', long = "device", default_value = "jieli", value_parser = chip_value_parser())]
+        device: String,
+    },
+    /// Hardware-reset the device via DTR/RTS (UART) or USB protocol
+    Reset {
+        /// Serial port (default: first available; optional for USB chips like JieLi)
+        #[arg(short = 'p', long = "port")]
+        port: Option<String>,
+        /// Chip id: Beken uses the same DTR/RTS pulse as flash handshake (bk7231n/t2 vs t5ai/t3/t1/t9); ESP32* uses espflash hard_reset; JieLi uses USB/protocol reset
         #[arg(short = 'd', long = "device", default_value = "bk7231n", value_parser = chip_value_parser())]
         device: String,
     },
@@ -707,15 +720,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&rows)?);
         }
         Commands::Reset { port, device } => {
-            let port = match port {
-                Some(p) => p,
-                None => choose_port()?,
-            };
             let chip_id = normalize_chip_id(&device);
-            log::info!("[cli] reset port={} chip={}", port, chip_id);
-            device_reset_dtr_rts(&port, &chip_id)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-            log::info!("Device reset (DTR/RTS) completed on {}", port);
+            if chip_id == "JIELI" && (port.is_none() || port.as_deref() == Some("auto")) {
+                log::info!("[cli] reset jieli via USB");
+                tyutool_core::plugins::jieli::run_reset(None, None)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+                eprintln!("Device reset completed via JieLi USB");
+            } else {
+                let port = match port {
+                    Some(p) => p,
+                    None => choose_port()?,
+                };
+                log::info!("[cli] reset port={} chip={}", port, chip_id);
+                if chip_id == "JIELI" {
+                    tyutool_core::plugins::jieli::run_reset(Some(&port), None)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+                    eprintln!("Device reset completed on {}", port);
+                } else {
+                    device_reset_dtr_rts(&port, &chip_id)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+                    log::info!("Device reset (DTR/RTS) completed on {}", port);
+                }
+            }
+        }
+        Commands::Probe { device, port, baud } => {
+            let chip_id = normalize_chip_id(&device);
+            if chip_id == "JIELI" {
+                log::info!("[cli] probe jieli port={:?} baud={:?}", port, baud);
+                let info =
+                    tyutool_core::plugins::jieli::run_probe(port.as_deref(), baud, Some(&device))?;
+                print!("{}", info);
+            } else {
+                return Err(format!("Device probe not supported yet for chip '{}'", device).into());
+            }
         }
         Commands::Update { check, source } => {
             log::info!("[cli] update check={} source={:?}", check, source);
@@ -945,6 +982,40 @@ mod tests {
                 assert_eq!(port, None);
             }
             _ => panic!("expected Commands::Write"),
+        }
+    }
+
+    #[test]
+    fn cli_jieli_reset_does_not_require_port_flag() {
+        let cli = Cli::try_parse_from(["tyutool", "reset", "--device", "jieli"]).unwrap();
+        match cli.command {
+            Commands::Reset { device, port } => {
+                assert_eq!(device, "jieli");
+                assert_eq!(port, None);
+            }
+            _ => panic!("expected Commands::Reset"),
+        }
+    }
+
+    #[test]
+    fn cli_probe_command_parses_flags() {
+        let cli = Cli::try_parse_from(["tyutool", "probe", "--device", "wl82"]).unwrap();
+        match cli.command {
+            Commands::Probe { device, port, baud } => {
+                assert_eq!(device, "jieli");
+                assert_eq!(port, None);
+                assert_eq!(baud, None);
+            }
+            _ => panic!("expected Commands::Probe"),
+        }
+
+        let cli2 = Cli::try_parse_from(["tyutool", "info", "-d", "wl83", "-p", "COM3"]).unwrap();
+        match cli2.command {
+            Commands::Probe { device, port, .. } => {
+                assert_eq!(device, "jieli");
+                assert_eq!(port, Some("COM3".to_string()));
+            }
+            _ => panic!("expected Commands::Probe"),
         }
     }
 

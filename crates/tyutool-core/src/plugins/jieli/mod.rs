@@ -3,6 +3,10 @@
 //! Flashes JieLi WL82, WL83, AC791N, and AC792N devices over USB Mass Storage
 //! Bulk-Only Transport (BOT, 0xFC SCSI CDB) without requiring a serial COM port.
 
+pub mod crypto;
+pub mod scsi;
+pub mod serial;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -73,9 +77,7 @@ impl FlashPlugin for JieliPlugin {
             FlashMode::Flash => run_flash(job, cancel, progress),
             FlashMode::Erase => run_erase(job, cancel, progress),
             FlashMode::Read => run_read(job, cancel, progress),
-            FlashMode::Authorize => Err(FlashError::Plugin(
-                "JIELI: authorize mode not supported".into(),
-            )),
+            FlashMode::Authorize => crate::authorize::run_authorize(job, cancel, progress),
         }
     }
 }
@@ -174,6 +176,17 @@ fn run_via_python_flasher(
         .stdout
         .take()
         .ok_or_else(|| FlashError::Plugin("failed to capture JieLi flasher stdout".into()))?;
+    let stderr = child.stderr.take();
+
+    let stderr_handle = stderr.map(|err_pipe| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let mut r = BufReader::new(err_pipe);
+            let _ = r.read_to_string(&mut buf);
+            buf
+        })
+    });
 
     use std::io::{BufRead, BufReader};
     let reader = BufReader::new(stdout);
@@ -231,11 +244,20 @@ fn run_via_python_flasher(
         FlashError::Plugin(format!("failed to wait for JieLi python flasher: {}", e))
     })?;
 
+    let err_msg = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
     if !status.success() {
         let code = status.code().unwrap_or(-1);
+        let detail = if !err_msg.trim().is_empty() {
+            format!(": {}", err_msg.trim())
+        } else {
+            String::new()
+        };
         return Err(FlashError::Plugin(format!(
-            "JieLi flasher exited with failure code {}",
-            code
+            "JieLi flasher exited with failure code {}{}",
+            code, detail
         )));
     }
 
@@ -246,31 +268,243 @@ fn run_via_python_flasher(
     Ok(())
 }
 
+pub fn resolve_transport_and_chip_args(
+    port: Option<&str>,
+    baud: Option<u32>,
+    chip_id: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    let is_serial = match port {
+        Some(p) => !p.is_empty() && p != "auto",
+        None => false,
+    };
+
+    if is_serial {
+        let p = port.unwrap();
+        args.push("-m".to_string());
+        args.push("serial".to_string());
+        args.push("-p".to_string());
+        args.push(p.to_string());
+        if let Some(b) = baud {
+            if b > 0 {
+                args.push("-b".to_string());
+                args.push(b.to_string());
+            }
+        }
+    } else {
+        args.push("-m".to_string());
+        args.push("usb".to_string());
+    }
+
+    if let Some(chip) = chip_id {
+        let chip_lower = chip.to_ascii_lowercase();
+        if chip_lower.contains("wl83") || chip_lower.contains("ac792") {
+            args.push("-dev".to_string());
+            args.push("wl83".to_string());
+            args.push("-boot".to_string());
+            args.push("0x103000".to_string());
+        } else if chip_lower.contains("wl82") || chip_lower.contains("ac791") {
+            args.push("-dev".to_string());
+            args.push("wl82".to_string());
+            args.push("-boot".to_string());
+            args.push("0x1c02000".to_string());
+        }
+    }
+
+    args
+}
+
+pub fn run_reset(port: Option<&str>, delay_ms: Option<u32>) -> Result<(), FlashError> {
+    if let Some(p) = port {
+        if !p.is_empty() && p != "auto" {
+            let delay = delay_ms.unwrap_or(500);
+            return serial::run_serial_reset(p, 921600, delay);
+        }
+    }
+
+    let delay = delay_ms.unwrap_or(500);
+    match scsi::run_scsi_reset(delay) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            if locate_python_flasher().is_none() {
+                return Err(e);
+            }
+            log::warn!(
+                "Native SCSI reset note ({}), attempting Python fallback...",
+                e
+            );
+        }
+    }
+
+    let cancel = AtomicBool::new(false);
+    let mut args = resolve_transport_and_chip_args(port, None, None);
+    args.push("--reset".to_string());
+    if let Some(d) = delay_ms {
+        args.push("-reboot".to_string());
+        args.push(d.to_string());
+    }
+    run_via_python_flasher(&args, &cancel, &|_| {})
+}
+
+pub fn run_probe(
+    port: Option<&str>,
+    baud: Option<u32>,
+    chip_id: Option<&str>,
+) -> Result<String, FlashError> {
+    if let Some(p) = port {
+        if !p.is_empty() && p != "auto" {
+            let b = baud.unwrap_or(921600);
+            return serial::run_serial_probe(p, b);
+        }
+    }
+
+    match scsi::run_scsi_probe() {
+        Ok(info) => return Ok(info),
+        Err(e) => {
+            if locate_python_flasher().is_none() {
+                return Err(e);
+            }
+            log::warn!(
+                "Native SCSI probe note ({}), attempting Python fallback...",
+                e
+            );
+        }
+    }
+
+    let flasher_script = locate_python_flasher().ok_or_else(|| {
+        FlashError::Plugin(
+            "JieLi flasher engine not found. Ensure TuyaOpen-JieLi tools are present or set JIELI_FLASHER_PY."
+                .into(),
+        )
+    })?;
+
+    let mut args = resolve_transport_and_chip_args(port, baud, chip_id);
+    args.push("--probe".to_string());
+
+    let python_bin = if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        "python3"
+    } else {
+        "python"
+    };
+
+    let output = std::process::Command::new(python_bin)
+        .arg(&flasher_script)
+        .args(&args)
+        .output()
+        .map_err(|e| FlashError::Plugin(format!("failed to spawn JieLi probe: {}", e)))?;
+
+    if !output.status.success() {
+        let err_text = String::from_utf8_lossy(&output.stderr);
+        return Err(FlashError::Plugin(format!(
+            "JieLi probe failed (exit code {:?}): {}",
+            output.status.code(),
+            err_text.trim()
+        )));
+    }
+
+    let out_text = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(out_text)
+}
+
 fn run_flash(
     job: &FlashJob,
     cancel: &AtomicBool,
     progress: &dyn Fn(FlashEvent),
 ) -> Result<(), FlashError> {
+    if !job.port.is_empty() && job.port != "auto" {
+        return serial::run_serial_flash(job, cancel, progress);
+    }
+
+    match scsi::run_scsi_flash(job, cancel, progress) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(FlashError::Cancelled);
+            }
+            if locate_python_flasher().is_none() {
+                return Err(e);
+            }
+            log::warn!(
+                "Native SCSI flash note ({}), attempting Python fallback...",
+                e
+            );
+        }
+    }
+
+    let chip_lower = job.chip_id.to_ascii_lowercase();
+    let default_reboot_delay = if chip_lower.contains("wl83") || chip_lower.contains("ac792") {
+        "50"
+    } else {
+        "500"
+    };
+
+    if let Some(segments) = &job.segments {
+        if !segments.is_empty() {
+            let total_segs = segments.len();
+            for (idx, seg) in segments.iter().enumerate() {
+                let start_addr = parse_hex_u32(Some(&seg.start_addr), 0x00000000)?;
+                let is_last = idx + 1 == total_segs;
+
+                let mut args = resolve_transport_and_chip_args(
+                    Some(&job.port),
+                    Some(job.baud_rate),
+                    Some(&job.chip_id),
+                );
+                args.push("-wflash".to_string());
+                args.push(format!("0x{:08X}", start_addr));
+                args.push(seg.firmware_path.clone());
+
+                if is_last {
+                    args.push("-reboot".to_string());
+                    args.push(default_reboot_delay.to_string());
+                } else {
+                    args.push("--no-reboot".to_string());
+                }
+
+                let seg_progress = |e: FlashEvent| match e {
+                    FlashEvent::Percent { value } => {
+                        let total_pct =
+                            ((idx as u32 * 100 + value as u32) / total_segs as u32) as u8;
+                        progress(FlashEvent::Percent {
+                            value: total_pct.min(100),
+                        });
+                    }
+                    FlashEvent::Phase { phase } => {
+                        if idx == 0 || matches!(phase, FlashPhase::Write | FlashPhase::Verify) {
+                            progress(FlashEvent::Phase { phase });
+                        }
+                    }
+                    FlashEvent::Milestone { milestone } => {
+                        if is_last {
+                            progress(FlashEvent::Milestone { milestone });
+                        }
+                    }
+                    other => progress(other),
+                };
+
+                run_via_python_flasher(&args, cancel, &seg_progress)?;
+            }
+            return Ok(());
+        }
+    }
+
     let firmware_path = job
         .firmware_path
         .as_deref()
         .ok_or_else(|| FlashError::Plugin("JieLi flash requires firmware_path (-f)".into()))?;
 
     let start_addr = parse_hex_u32(job.flash_start_hex.as_deref(), 0x00000000)?;
-    let mut args = vec![
-        "-m".to_string(),
-        "usb".to_string(),
-        "-wflash".to_string(),
-        format!("0x{:08X}", start_addr),
-        firmware_path.to_string(),
-        "-reboot".to_string(),
-        "500".to_string(),
-    ];
-
-    if !job.port.is_empty() && job.port != "auto" {
-        args.push("-p".to_string());
-        args.push(job.port.clone());
-    }
+    let mut args =
+        resolve_transport_and_chip_args(Some(&job.port), Some(job.baud_rate), Some(&job.chip_id));
+    args.push("-wflash".to_string());
+    args.push(format!("0x{:08X}", start_addr));
+    args.push(firmware_path.to_string());
+    args.push("-reboot".to_string());
+    args.push(default_reboot_delay.to_string());
 
     run_via_python_flasher(&args, cancel, progress)
 }
@@ -280,22 +514,35 @@ fn run_erase(
     cancel: &AtomicBool,
     progress: &dyn Fn(FlashEvent),
 ) -> Result<(), FlashError> {
+    if !job.port.is_empty() && job.port != "auto" {
+        return serial::run_serial_erase(job, cancel, progress);
+    }
+
+    match scsi::run_scsi_erase(job, cancel, progress) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(FlashError::Cancelled);
+            }
+            if locate_python_flasher().is_none() {
+                return Err(e);
+            }
+            log::warn!(
+                "Native SCSI erase note ({}), attempting Python fallback...",
+                e
+            );
+        }
+    }
+
     let start_addr = parse_hex_u32(job.erase_start_hex.as_deref(), 0x00000000)?;
     let end_addr = parse_hex_u32(job.erase_end_hex.as_deref(), start_addr + 0x00200000)?;
     let len = end_addr.saturating_sub(start_addr);
 
-    let mut args = vec![
-        "-m".to_string(),
-        "usb".to_string(),
-        "--erase-flash".to_string(),
-        format!("0x{:08X}", start_addr),
-        format!("0x{:08X}", len),
-    ];
-
-    if !job.port.is_empty() && job.port != "auto" {
-        args.push("-p".to_string());
-        args.push(job.port.clone());
-    }
+    let mut args =
+        resolve_transport_and_chip_args(Some(&job.port), Some(job.baud_rate), Some(&job.chip_id));
+    args.push("--erase-flash".to_string());
+    args.push(format!("0x{:08X}", start_addr));
+    args.push(format!("0x{:08X}", len));
 
     run_via_python_flasher(&args, cancel, progress)
 }
@@ -305,6 +552,26 @@ fn run_read(
     cancel: &AtomicBool,
     progress: &dyn Fn(FlashEvent),
 ) -> Result<(), FlashError> {
+    if !job.port.is_empty() && job.port != "auto" {
+        return serial::run_serial_read(job, cancel, progress);
+    }
+
+    match scsi::run_scsi_read(job, cancel, progress) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(FlashError::Cancelled);
+            }
+            if locate_python_flasher().is_none() {
+                return Err(e);
+            }
+            log::warn!(
+                "Native SCSI read note ({}), attempting Python fallback...",
+                e
+            );
+        }
+    }
+
     let read_path = job
         .read_file_path
         .as_deref()
@@ -314,19 +581,12 @@ fn run_read(
     let end_addr = parse_hex_u32(job.read_end_hex.as_deref(), start_addr + 0x00200000)?;
     let len = end_addr.saturating_sub(start_addr);
 
-    let mut args = vec![
-        "-m".to_string(),
-        "usb".to_string(),
-        "--read-flash".to_string(),
-        format!("0x{:08X}", start_addr),
-        format!("0x{:08X}", len),
-        read_path.to_string(),
-    ];
-
-    if !job.port.is_empty() && job.port != "auto" {
-        args.push("-p".to_string());
-        args.push(job.port.clone());
-    }
+    let mut args =
+        resolve_transport_and_chip_args(Some(&job.port), Some(job.baud_rate), Some(&job.chip_id));
+    args.push("--read-flash".to_string());
+    args.push(format!("0x{:08X}", start_addr));
+    args.push(format!("0x{:08X}", len));
+    args.push(read_path.to_string());
 
     run_via_python_flasher(&args, cancel, progress)
 }
@@ -359,5 +619,38 @@ mod tests {
         assert_eq!(cdb[7], 0x00);
         assert_eq!(cdb[8], 0xAB);
         assert_eq!(cdb[9], 0xCD);
+    }
+
+    #[test]
+    fn resolve_args_usb_mode_default() {
+        let args = resolve_transport_and_chip_args(None, None, None);
+        assert_eq!(args, vec!["-m", "usb"]);
+
+        let args_auto = resolve_transport_and_chip_args(Some("auto"), None, None);
+        assert_eq!(args_auto, vec!["-m", "usb"]);
+    }
+
+    #[test]
+    fn resolve_args_serial_mode_with_port_and_baud() {
+        let args = resolve_transport_and_chip_args(Some("/dev/ttyUSB0"), Some(921600), None);
+        assert_eq!(
+            args,
+            vec!["-m", "serial", "-p", "/dev/ttyUSB0", "-b", "921600"]
+        );
+    }
+
+    #[test]
+    fn resolve_args_wl83_chip_params() {
+        let args = resolve_transport_and_chip_args(None, None, Some("wl83"));
+        assert_eq!(args, vec!["-m", "usb", "-dev", "wl83", "-boot", "0x103000"]);
+    }
+
+    #[test]
+    fn resolve_args_wl82_chip_params() {
+        let args = resolve_transport_and_chip_args(None, None, Some("ac791n"));
+        assert_eq!(
+            args,
+            vec!["-m", "usb", "-dev", "wl82", "-boot", "0x1c02000"]
+        );
     }
 }

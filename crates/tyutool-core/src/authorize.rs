@@ -209,6 +209,7 @@ const CHIP_TIMING: &[ChipTimingRow] = &[
     //                                            start  int   max   idle settle drain_q  mac_ret mac_ms auth_ret auth_ms
     (&["T5AI", "T5", "T9"],                        600,  50, 30000,  50,  3000,   800,       3,    500,      2,    200), // warm ready 627/636/642ms (3 runs, 2026-07-31), RTT ~11ms; max_wait=30000 is a CONSERVATIVE ESTIMATE, NOT a measurement — see the note below
     (&["ESP32", "ESP32C3", "ESP32C6", "ESP32S3"], 1000,  50,  3500, 120,  3000,   400,       3,    500,      2,    200), // warm ready ~1108ms, RTT 20–40ms (2026-06-25); no cold-boot misdetect observed yet — if one appears, raise max_wait the same way
+    (&["JIELI", "WL82", "WL83", "AC791N", "AC792N"], 800,  50,  5000, 100,  3000,   500,       3,    500,      2,    200), // JieLi (WL82/WL83) warm ready ~800ms
 ];
 
 impl AuthTiming {
